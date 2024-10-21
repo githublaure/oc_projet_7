@@ -1,86 +1,63 @@
+# This code implements an API using FastAPI to serve predictions and explanations for a credit model. 
+# The model utilizes a pre-trained pipeline and SHAP (SHapley Additive exPlanations) values to interpret predictions.
+
 from fastapi import FastAPI, HTTPException
+import joblib
 import pandas as pd
-import pickle
-import shap
-import uvicorn
+import numpy as np
 
-# Charger le modèle XGBoost et l'explainer SHAP à partir des fichiers enregistrés
-with open('models/xgboost_classifier.pckl', 'rb') as f:
-    model = pickle.load(f)
+# Load the complete pipeline which includes both preprocessing steps and the trained XGBoost model.
+pipeline_path = "xgb_pipeline_tuned.pkl"
+loaded_pipeline = joblib.load(pipeline_path)
 
-with open('models/xgboost_shap_explainer.pckl', 'rb') as f:
-    explainer = pickle.load(f)
+# Load the SHAP explainer for interpreting the model's predictions.
+explainer_path = "shap_explainer.pkl"
+loaded_shap_explainer = joblib.load(explainer_path)
 
-# Charge les données des clients à partir d'un fichier CSV
-client_data = pd.read_csv('data/processed/test_feature_engineering.csv')
-
-# Initialiser FastAPI pour créer l'API
+# Create an instance of the FastAPI to build the web API.
 app = FastAPI()
 
-# 1. Route pour faire une prédiction à partir de SK_CURRENT_ID
-"""Route /predict :
+# Load client data from a CSV file. This data includes the feature set required for predictions.
+data_clients = pd.read_csv("test_feature_engineering_sample.csv")
 
-Input : SK_CURRENT_ID du client.
-Output : La prédiction du modèle XGBoost (si le client est susceptible de rembourser ou non).
-Fonctionnement : Le modèle prédit à partir des données du client en excluant SK_CURRENT_ID."""
-
-@app.get("/predict")
-def predict(SK_CURRENT_ID: int):
-    # Recherche les données du client dans le DataFrame à partir de SK_CURRENT_ID
-    client_row = client_data[client_data['SK_CURRENT_ID'] == SK_CURRENT_ID]
-    
-    # Si les données du client n'existent pas, retourne une erreur 404
-    if client_row.empty:
+# Define an endpoint to get client data by client ID.
+@app.get("/client_data/{client_id}")
+# Function to fetch client data when provided with a specific client ID.
+def get_client_data(client_id: int):
+    # Select rows where the client ID matches the provided value.
+    client_data = data_clients[data_clients["SK_ID_CURR"] == float(client_id)]
+    # If no data is found, return a 404 error.
+    if client_data.empty:
         raise HTTPException(status_code=404, detail="Client not found")
+    # Return the client's data as JSON.
+    return {"data": client_data.to_dict(orient="records")}
 
-    #  prédiction en utilisant le modèle chargé (en excluant la colonne SK_CURRENT_ID)
-    prediction = model.predict(client_row.drop(columns=['SK_CURRENT_ID']))[0]
-    
-    # Retourner l'ID du client et la prédiction sous forme de JSON
-    return {"SK_CURRENT_ID": SK_CURRENT_ID, "prediction": int(prediction)}
-
-# 2. Route pour retourner les données du client à partir de SK_CURRENT_ID
-
-"""Route /client_data :
-
-Input : SK_CURRENT_ID du client.
-Output : Les données brutes du client sous forme de dictionnaire JSON.
-Fonctionnement : Renvoie les données complètes pour un client particulier."""
-
-@app.get("/client_data")
-def get_client_data(SK_CURRENT_ID: int):
-    # Recherche les données du client dans le DataFrame
-    client_row = client_data[client_data['SK_CURRENT_ID'] == SK_CURRENT_ID]
-    
-    # Si le client n'est pas trouvé, retourner une erreur 404
-    if client_row.empty:
+# Define an endpoint to make predictions for a given client ID.
+@app.get("/prediction/{client_id}")
+# Function that returns a prediction score and threshold for a particular client.
+def get_prediction(client_id: int):
+    # Extract the data for the specified client and drop the TARGET column if it exists.
+    client_data = data_clients[data_clients["SK_ID_CURR"] == float(client_id)].drop(columns=["TARGET"], errors='ignore')
+    # If no data is found for the client, return a 404 error.
+    if client_data.empty:
         raise HTTPException(status_code=404, detail="Client not found")
+    # Use the loaded pipeline to predict probabilities.
+    prediction_proba = loaded_pipeline.predict_proba(client_data.to_numpy())[:, 1][0]  # Extract the prediction probability for the positive class.
+    # Retrieve the decision threshold used by the loaded model.
+    threshold = loaded_pipeline.named_steps['model'].get_threshold()
+    # Return the prediction probability and threshold as a response.
+    return {"score": float(prediction_proba), "threshold": float(threshold)}
 
-    # Retourne les données du client sous forme de dictionnaire JSON
-    return client_row.to_dict(orient='records')
-
-# 3. Route pour obtenir les valeurs SHAP d'un client à partir de SK_CURRENT_ID
-"""Route /shap_values :
-
-Input : SK_CURRENT_ID du client.
-Output : Les valeurs SHAP du client pour expliquer la prédiction du modèle.
-Fonctionnement : Utilise l'explainer SHAP pour donner les contributions des features individuelles à la prédiction."""
-@app.get("/shap_values")
-
-def get_shap_values(SK_CURRENT_ID: int):
-    # Recherche les données du client, en excluant la colonne SK_CURRENT_ID
-    client_row = client_data[client_data['SK_CURRENT_ID'] == SK_CURRENT_ID].drop(columns=['SK_CURRENT_ID'])
-    
-    # Si le client n'est pas trouvé, retourner une erreur 404
-    if client_row.empty:
+# Define an endpoint to obtain SHAP values, which explain the prediction for a specific client ID.
+@app.get("/shap_values/{client_id}")
+# Function that returns SHAP values for the specified client.
+def get_shap_values(client_id: int):
+    # Retrieve data for the client and drop the TARGET column if present.
+    client_data = data_clients[data_clients["SK_ID_CURR"] == float(client_id)].drop(columns=["TARGET"], errors='ignore')
+    # If the client data set is empty, return a 404 error.
+    if client_data.empty:
         raise HTTPException(status_code=404, detail="Client not found")
-    
-    # Calcule les valeurs SHAP pour le client
-    shap_values = explainer.shap_values(client_row)
-    
-    # Retourne les valeurs SHAP sous forme de liste JSON
-    return {"SK_CURRENT_ID": SK_CURRENT_ID, "shap_values": shap_values.tolist()}
-
-# Démarre le serveur FastAPI en mode local sur le port 8000
-if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    # Compute SHAP values for the retrieved client data.
+    client_shap_values = loaded_shap_explainer.shap_values(client_data.to_numpy())
+    # Return the computed SHAP values.
+    return {"shap_values": client_shap_values.tolist()}
